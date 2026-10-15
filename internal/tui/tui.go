@@ -24,13 +24,20 @@ var (
 	subtleStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
 	selectedStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("212"))
 	appStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("81"))
+	cmdStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("222"))
 	errStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
 	okStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("82"))
 )
 
 type appEntry struct{ bundle, name string }
 
-type binding struct{ key, bundle, name string }
+// entry is one binding: either an app cycle or an AeroSpace action.
+type entry struct {
+	key   string
+	kind  string // "app" | "action"
+	value string // bundle id or AeroSpace command
+	name  string // resolved app name (app kind only)
+}
 
 // appItem adapts an app to bubbles/list.
 type appItem struct{ appEntry }
@@ -46,19 +53,22 @@ const (
 	modeAddKey
 	modePickApp
 	modeAddBundle
+	modeAddCmd
 )
 
 type model struct {
-	cfgPath  string
-	timeout  int
-	bindings []binding
-	apps     []appEntry
+	cfgPath string
+	timeout int
+	entries []entry
+	apps    []appEntry
 
-	mode     mode
-	cursor   int
-	keyIn    textinput.Model
-	bundleIn textinput.Model
-	appList  list.Model
+	mode        mode
+	pendingKind string // "app" | "action"
+	cursor      int
+	keyIn       textinput.Model
+	bundleIn    textinput.Model
+	cmdIn       textinput.Model
+	appList     list.Model
 
 	status string
 	isErr  bool
@@ -71,7 +81,7 @@ func Run() error {
 	path := config.DefaultPath()
 	cfg, err := config.Load(path)
 	if err != nil {
-		cfg = &config.Config{CycleTimeoutMS: 1200, Apps: map[string]string{}}
+		cfg = &config.Config{CycleTimeoutMS: 1200, Apps: map[string]string{}, Actions: map[string]string{}}
 	}
 	m := newModel(path, cfg, loadRunningApps())
 	p := tea.NewProgram(m, tea.WithAltScreen())
@@ -80,17 +90,6 @@ func Run() error {
 }
 
 func newModel(cfgPath string, cfg *config.Config, apps []appEntry) model {
-	names := map[string]string{}
-	for _, a := range apps {
-		names[a.bundle] = a.name
-	}
-
-	bs := make([]binding, 0, len(cfg.Apps))
-	for k, b := range cfg.Apps {
-		bs = append(bs, binding{key: k, bundle: b, name: names[b]})
-	}
-	sort.Slice(bs, func(i, j int) bool { return bs[i].key < bs[j].key })
-
 	ki := textinput.New()
 	ki.Placeholder = "single key, e.g. d"
 	ki.CharLimit = 1
@@ -101,7 +100,20 @@ func newModel(cfgPath string, cfg *config.Config, apps []appEntry) model {
 	bi.CharLimit = 128
 	bi.Width = 48
 
-	return model{cfgPath: cfgPath, timeout: cfg.CycleTimeoutMS, bindings: bs, apps: apps, keyIn: ki, bundleIn: bi}
+	ci := textinput.New()
+	ci.Placeholder = "e.g. move left"
+	ci.CharLimit = 256
+	ci.Width = 48
+
+	return model{
+		cfgPath:  cfgPath,
+		timeout:  cfg.CycleTimeoutMS,
+		entries:  entriesFrom(cfg, apps),
+		apps:     apps,
+		keyIn:    ki,
+		bundleIn: bi,
+		cmdIn:    ci,
+	}
 }
 
 func (m model) Init() tea.Cmd { return nil }
@@ -118,6 +130,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateAddKey(msg)
 		case modeAddBundle:
 			return m.updateAddBundle(msg)
+		case modeAddCmd:
+			return m.updateAddCmd(msg)
 		case modePickApp:
 			return m.updatePickApp(msg)
 		default:
@@ -132,7 +146,11 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "q", "ctrl+c":
 		m.done = true
 		return m, tea.Quit
-	case "a":
+	case "a", "A":
+		m.pendingKind = "app"
+		if msg.String() == "A" {
+			m.pendingKind = "action"
+		}
 		m.mode = modeAddKey
 		m.keyIn.SetValue("")
 		m.keyIn.Focus()
@@ -142,13 +160,13 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.cursor--
 		}
 	case "down", "j":
-		if m.cursor < len(m.bindings)-1 {
+		if m.cursor < len(m.entries)-1 {
 			m.cursor++
 		}
 	case "x", "d", "delete", "backspace":
-		if len(m.bindings) > 0 {
-			m.bindings = append(m.bindings[:m.cursor], m.bindings[m.cursor+1:]...)
-			if m.cursor >= len(m.bindings) && m.cursor > 0 {
+		if len(m.entries) > 0 {
+			m.entries = append(m.entries[:m.cursor], m.entries[m.cursor+1:]...)
+			if m.cursor >= len(m.entries) && m.cursor > 0 {
 				m.cursor--
 			}
 			m.status, m.isErr = "removed (press s to save)", false
@@ -158,7 +176,7 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "r":
 		if cfg, err := config.Load(m.cfgPath); err == nil {
 			m.timeout = cfg.CycleTimeoutMS
-			m.bindings = bindingsFrom(cfg, m.apps)
+			m.entries = entriesFrom(cfg, m.apps)
 			m.cursor = 0
 			m.status, m.isErr = "reloaded from disk", false
 		} else {
@@ -183,9 +201,15 @@ func (m model) updateAddKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.status, m.isErr = fmt.Sprintf("%q is not a valid key", k), true
 			return m, nil
 		}
-		m.mode = modePickApp
-		m.initAppList()
 		m.status = ""
+		if m.pendingKind == "action" {
+			m.mode = modeAddCmd
+			m.cmdIn.SetValue("")
+			m.cmdIn.Focus()
+		} else {
+			m.mode = modePickApp
+			m.initAppList()
+		}
 		return m, nil
 	}
 	var cmd tea.Cmd
@@ -204,11 +228,31 @@ func (m model) updateAddBundle(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.status, m.isErr = "type a bundle id", true
 			return m, nil
 		}
-		m.addBinding(m.keyIn.Value(), b)
+		m.addEntry(m.keyIn.Value(), "app", b)
 		return m, nil
 	}
 	var cmd tea.Cmd
 	m.bundleIn, cmd = m.bundleIn.Update(msg)
+	return m, cmd
+}
+
+func (m model) updateAddCmd(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		m.mode = modeAddKey
+		m.keyIn.Focus()
+		return m, nil
+	case "enter":
+		c := strings.TrimSpace(m.cmdIn.Value())
+		if c == "" {
+			m.status, m.isErr = "type an AeroSpace command", true
+			return m, nil
+		}
+		m.addEntry(m.keyIn.Value(), "action", c)
+		return m, nil
+	}
+	var cmd tea.Cmd
+	m.cmdIn, cmd = m.cmdIn.Update(msg)
 	return m, cmd
 }
 
@@ -226,7 +270,7 @@ func (m model) updatePickApp(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.bundleIn.Focus()
 				return m, nil
 			}
-			m.addBinding(m.keyIn.Value(), it.bundle)
+			m.addEntry(m.keyIn.Value(), "app", it.bundle)
 			return m, nil
 		}
 		return m, nil
@@ -258,19 +302,23 @@ func (m *model) initAppList() {
 	m.appList = l
 }
 
-func (m *model) addBinding(key, bundle string) {
+func (m *model) addEntry(key, kind, value string) {
 	key = strings.ToLower(strings.TrimSpace(key))
-	name := m.nameFor(bundle)
-	for i := range m.bindings {
-		if m.bindings[i].key == key {
-			m.bindings[i] = binding{key: key, bundle: bundle, name: name}
-			m.mode, m.status, m.isErr = modeList, "updated right-\u2318+"+key+" (press s to save)", false
-			return
+	name := ""
+	if kind == "app" {
+		name = m.nameFor(value)
+	}
+	// Replace any existing binding on this key (either kind).
+	for i := range m.entries {
+		if m.entries[i].key == key {
+			m.entries = append(m.entries[:i], m.entries[i+1:]...)
+			break
 		}
 	}
-	m.bindings = append(m.bindings, binding{key: key, bundle: bundle, name: name})
-	sort.Slice(m.bindings, func(i, j int) bool { return m.bindings[i].key < m.bindings[j].key })
-	m.mode, m.status, m.isErr = modeList, "added right-\u2318+"+key+" (press s to save)", false
+	m.entries = append(m.entries, entry{key: key, kind: kind, value: value, name: name})
+	sort.Slice(m.entries, func(i, j int) bool { return m.entries[i].key < m.entries[j].key })
+	m.mode, m.isErr = modeList, false
+	m.status = fmt.Sprintf("set right-\u2318+%s (press s to save)", key)
 }
 
 func (m model) nameFor(bundle string) string {
@@ -283,9 +331,17 @@ func (m model) nameFor(bundle string) string {
 }
 
 func (m *model) save() {
-	cfg := &config.Config{CycleTimeoutMS: m.timeout, Apps: map[string]string{}}
-	for _, b := range m.bindings {
-		cfg.Apps[b.key] = b.bundle
+	cfg := &config.Config{
+		CycleTimeoutMS: m.timeout,
+		Apps:           map[string]string{},
+		Actions:        map[string]string{},
+	}
+	for _, e := range m.entries {
+		if e.kind == "action" {
+			cfg.Actions[e.key] = e.value
+		} else {
+			cfg.Apps[e.key] = e.value
+		}
 	}
 	if err := config.Save(m.cfgPath, cfg); err != nil {
 		m.status, m.isErr = err.Error(), true
@@ -308,25 +364,31 @@ func (m model) View() string {
 
 	switch m.mode {
 	case modeList:
-		if len(m.bindings) == 0 {
-			b.WriteString(subtleStyle.Render("no shortcuts yet \u2014 press 'a' to add one") + "\n")
+		if len(m.entries) == 0 {
+			b.WriteString(subtleStyle.Render("no shortcuts yet \u2014 'a' adds an app, 'A' adds an action") + "\n")
 		}
-		for i, bd := range m.bindings {
-			name := bd.name
-			if name == "" {
-				name = bd.bundle
+		for i, e := range m.entries {
+			var rest string
+			if e.kind == "action" {
+				rest = cmdStyle.Render(pad("\u2192 "+e.value, 34))
+			} else {
+				name := e.name
+				if name == "" {
+					name = e.value
+				}
+				rest = appStyle.Render(pad(name, 20)) + " " + subtleStyle.Render(e.value)
 			}
-			line := fmt.Sprintf("right-\u2318+%s   %s  %s", bd.key, appStyle.Render(pad(name, 20)), subtleStyle.Render(bd.bundle))
+			line := fmt.Sprintf("right-\u2318+%s   %s", e.key, rest)
 			if i == m.cursor {
 				b.WriteString(selectedStyle.Render("\u276f ") + line + "\n")
 			} else {
 				b.WriteString("  " + line + "\n")
 			}
 		}
-		b.WriteString("\n" + subtleStyle.Render("a add \u00b7 d delete \u00b7 s save \u00b7 r reload \u00b7 q quit") + "\n")
+		b.WriteString("\n" + subtleStyle.Render("a add app \u00b7 A add action \u00b7 d delete \u00b7 s save \u00b7 r reload \u00b7 q quit") + "\n")
 
 	case modeAddKey:
-		b.WriteString(titleStyle.Render("New shortcut") + "\n\n")
+		b.WriteString(titleStyle.Render("New "+m.pendingKind) + "\n\n")
 		b.WriteString("key to press with right-\u2318:\n" + m.keyIn.View() + "\n\n")
 		b.WriteString(subtleStyle.Render("valid keys: "+strings.Join(keymap.Names(), " ")) + "\n\n")
 		b.WriteString(subtleStyle.Render("enter confirm \u00b7 esc back") + "\n")
@@ -334,6 +396,12 @@ func (m model) View() string {
 	case modeAddBundle:
 		b.WriteString(titleStyle.Render("Bundle id") + "\n\n")
 		b.WriteString(m.bundleIn.View() + "\n\n")
+		b.WriteString(subtleStyle.Render("enter confirm \u00b7 esc back") + "\n")
+
+	case modeAddCmd:
+		b.WriteString(titleStyle.Render("AeroSpace command for right-\u2318+"+m.keyIn.Value()) + "\n\n")
+		b.WriteString(m.cmdIn.View() + "\n\n")
+		b.WriteString(subtleStyle.Render("e.g. move left \u00b7 fullscreen \u00b7 layout tiles horizontal vertical") + "\n")
 		b.WriteString(subtleStyle.Render("enter confirm \u00b7 esc back") + "\n")
 
 	case modePickApp:
@@ -353,17 +421,20 @@ func (m model) View() string {
 	return b.String()
 }
 
-func bindingsFrom(cfg *config.Config, apps []appEntry) []binding {
+func entriesFrom(cfg *config.Config, apps []appEntry) []entry {
 	names := map[string]string{}
 	for _, a := range apps {
 		names[a.bundle] = a.name
 	}
-	bs := make([]binding, 0, len(cfg.Apps))
-	for k, b := range cfg.Apps {
-		bs = append(bs, binding{key: k, bundle: b, name: names[b]})
+	out := make([]entry, 0, len(cfg.Apps)+len(cfg.Actions))
+	for k, v := range cfg.Apps {
+		out = append(out, entry{key: k, kind: "app", value: v, name: names[v]})
 	}
-	sort.Slice(bs, func(i, j int) bool { return bs[i].key < bs[j].key })
-	return bs
+	for k, v := range cfg.Actions {
+		out = append(out, entry{key: k, kind: "action", value: v})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].key < out[j].key })
+	return out
 }
 
 func loadRunningApps() []appEntry {

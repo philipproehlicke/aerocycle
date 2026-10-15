@@ -107,6 +107,13 @@ func (c *Client) Workspace(name string) error {
 	return err
 }
 
+// Eval runs an AeroSpace command expression exactly as `aerospace eval` does
+// (e.g. "move left", "layout tiles horizontal vertical", "a; b").
+func (c *Client) Eval(expr string) error {
+	_, err := c.run("eval", expr)
+	return err
+}
+
 // Event is one line of `aerospace subscribe`.
 type Event struct {
 	Event         string `json:"_event"`

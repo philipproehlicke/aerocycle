@@ -7,6 +7,8 @@ that adds **per-application window switching**:
   app comes into focus.
 - Press it again (within `cycle-timeout-ms`) → cycle through that app's other
   windows.
+- Or bind **right-⌘ + &lt;key&gt;** to an arbitrary AeroSpace command (e.g.
+  `move left`, `fullscreen`, `layout tiles horizontal vertical`).
 - Works alongside AeroSpace's tiling: cycling picks a specific window, wherever
   it lives, and AeroSpace brings it forward (switching workspaces if needed).
 
@@ -72,8 +74,9 @@ Check status:
 make tui               # or: aerocycle tui
 ```
 
-- `a` add a shortcut (choose a key, then pick from running apps)
-- `d` delete the highlighted shortcut
+- `a` add an app binding (choose a key, then pick from running apps)
+- `A` add an action binding (choose a key, then type an AeroSpace command)
+- `d` delete the highlighted binding
 - `s` save — and hot-reload the running daemon (via SIGHUP)
 - `r` reload from disk · `q` quit
 
@@ -82,10 +85,21 @@ Config lives at `~/.config/aerocycle/config.toml`:
 ```toml
 cycle-timeout-ms = 1200
 
+# right-<cmd>+<key> cycles that app's windows
 [apps]
-d = "com.vivaldi.Vivaldi"     # right-⌘ + d
-t = "com.googlecode.iterm2"   # right-⌘ + t
+d = "com.vivaldi.Vivaldi"
+t = "com.googlecode.iterm2"
+
+# right-<cmd>+<key> runs an AeroSpace command (via `aerospace eval`)
+[actions]
+h = "move left"
+j = "move down"
+k = "move up"
+l = "move right"
 ```
+
+A key may appear in `[apps]` or `[actions]`, but not both. Saving keeps a
+`config.toml.bak` backup.
 
 Find bundle ids with `aerocycle -list-apps`.
 

@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -22,7 +23,7 @@ import (
 	"aerocycle/internal/tui"
 )
 
-const version = "0.2.0"
+const version = "0.3.0"
 
 func main() {
 	// Subcommands must be handled before the flag package.
@@ -119,21 +120,37 @@ func main() {
 			// AeroSpace is down or disabled: let the combo reach the app.
 			return false
 		}
-		bundle, ok := current.Load().Apps[name]
-		if !ok {
-			return false
+		cfg := current.Load()
+
+		if bundle, ok := cfg.Apps[name]; ok {
+			if *debug {
+				log.Printf("right-\u2318+%s -> cycle %s (repeat=%v)", name, bundle, isRepeat)
+			}
+			if !isRepeat {
+				go func() {
+					if _, err := cy.Cycle(bundle); err != nil {
+						log.Printf("cycle %s: %v", bundle, err)
+					}
+				}()
+			}
+			return true
 		}
-		if *debug {
-			log.Printf("right-\u2318+%s -> %s (repeat=%v)", name, bundle, isRepeat)
+
+		if expr, ok := cfg.Actions[name]; ok {
+			if *debug {
+				log.Printf("right-\u2318+%s -> %s (repeat=%v)", name, expr, isRepeat)
+			}
+			if !isRepeat {
+				go func() {
+					if err := ac.Eval(expr); err != nil {
+						log.Printf("action %q: %v", expr, err)
+					}
+				}()
+			}
+			return true
 		}
-		if !isRepeat {
-			go func() {
-				if _, err := cy.Cycle(bundle); err != nil {
-					log.Printf("cycle %s: %v", bundle, err)
-				}
-			}()
-		}
-		return true
+
+		return false
 	})
 
 	waitForPermission()
@@ -142,7 +159,8 @@ func main() {
 	}
 	go hotkey.Run()
 
-	log.Printf("aerocycle %s running: %d shortcut(s) on right-\u2318 %v", version, len(cfg.Apps), appKeys(cfg))
+	log.Printf("aerocycle %s running: %d app(s) + %d action(s) on right-\u2318 %v",
+		version, len(cfg.Apps), len(cfg.Actions), appKeys(cfg))
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
@@ -195,10 +213,14 @@ Flags:
 }
 
 func appKeys(cfg *config.Config) []string {
-	keys := make([]string, 0, len(cfg.Apps))
+	keys := make([]string, 0, len(cfg.Apps)+len(cfg.Actions))
 	for k := range cfg.Apps {
 		keys = append(keys, k)
 	}
+	for k := range cfg.Actions {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
 	return keys
 }
 
@@ -232,15 +254,23 @@ func runSimulate(cfgPath string) {
 			continue
 		}
 		bundle, ok := cfg.Apps[key]
-		if !ok {
-			fmt.Printf("%s -> (no binding)\n", key)
+		if ok {
+			w, err := cy.Cycle(bundle)
+			if err != nil {
+				fmt.Printf("%s -> error: %v\n", key, err)
+				continue
+			}
+			fmt.Printf("%s -> %d  %s  [ws %s]  %q\n", key, w.ID, w.AppName, w.Workspace, w.Title)
 			continue
 		}
-		w, err := cy.Cycle(bundle)
-		if err != nil {
-			fmt.Printf("%s -> error: %v\n", key, err)
+		if expr, ok := cfg.Actions[key]; ok {
+			if err := ac.Eval(expr); err != nil {
+				fmt.Printf("%s -> action error: %v\n", key, err)
+			} else {
+				fmt.Printf("%s -> ran action: %s\n", key, expr)
+			}
 			continue
 		}
-		fmt.Printf("%s -> %d  %s  [ws %s]  %q\n", key, w.ID, w.AppName, w.Workspace, w.Title)
+		fmt.Printf("%s -> (no binding)\n", key)
 	}
 }
