@@ -1,0 +1,11 @@
+cycle-timeout-ms = 1200
+
+# Each key is pressed together with the RIGHT Command key.
+# Press once  -> the most recently used window of that app comes to focus.
+# Press again -> cycle through that app's other windows (within cycle-timeout-ms).
+#
+# Bundle ids: run `./bin/aerocycle -list-apps` to discover them.
+
+[apps]
+d = "com.vivaldi.Vivaldi"     # browser
+t = "com.googlecode.iterm2"   # terminal
